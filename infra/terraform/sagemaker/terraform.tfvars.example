@@ -1,0 +1,21 @@
+# ============================================================================
+# SageMaker Terraform Variables Example
+# Kopíruj tento súbor do terraform.tfvars a uprav hodnoty
+# ============================================================================
+
+# AWS Configuration
+aws_region   = "eu-west-1"
+project_name = "house-price-mlops"
+environment  = "prod"
+
+# ECR Repository
+ecr_repository_name = "house-price-mlops"
+
+# S3 Buckets (ponechaj prázdne pre auto-generated names)
+s3_data_bucket_name  = ""  # Will be: house-price-mlops-prod-data-{random}
+s3_model_bucket_name = ""  # Will be: house-price-mlops-prod-models-{random}
+s3_force_destroy     = false  # Nastav na true len pre dev/test
+
+# MLflow Integration (optional)
+# ARN MLflow S3 artifacts bucketu (z MLflow terraform output)
+mlflow_s3_bucket_arn = ""  # Example: arn:aws:s3:::house-price-mlops-prod-mlflow-artifacts-abc12345
