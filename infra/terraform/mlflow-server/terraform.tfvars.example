@@ -1,0 +1,47 @@
+# ============================================================================
+# Terraform Variables Example
+# Kopíruj tento súbor do terraform.tfvars a uprav hodnoty
+# ============================================================================
+
+# AWS Configuration
+aws_region   = "eu-west-1"
+project_name = "house-price-mlops"
+environment  = "prod"
+owner        = "Roman Ceresnak"
+
+# VPC Configuration
+vpc_cidr             = "10.0.0.0/16"
+availability_zones   = ["eu-west-1a", "eu-west-1b"]
+public_subnet_cidrs  = ["10.0.1.0/24", "10.0.2.0/24"]
+private_subnet_cidrs = ["10.0.11.0/24", "10.0.12.0/24"]
+
+# RDS Configuration
+db_instance_class          = "db.t3.micro"  # Pre production použi db.t3.small alebo vyšší
+db_name                    = "mlflow"
+db_username                = "mlflow_admin"
+db_password                = "CHANGE_ME_STRONG_PASSWORD"  # DÔLEŽITÉ: Zmeň na silné heslo!
+db_allocated_storage       = 20
+db_max_allocated_storage   = 100
+db_backup_retention_days   = 7
+
+# ECS / Fargate Configuration
+mlflow_image         = "ghcr.io/mlflow/mlflow:latest"
+mlflow_cpu           = 512   # 0.5 vCPU
+mlflow_memory        = 1024  # 1 GB
+mlflow_desired_count = 1
+mlflow_port          = 5000
+
+# ALB Configuration
+enable_https    = false  # Nastav na true ak máš ACM certifikát
+certificate_arn = ""     # ARN ACM certifikátu (ak enable_https = true)
+domain_name     = ""     # Doménové meno (voliteľné)
+
+# S3 Configuration
+s3_bucket_name  = ""     # Ponechaj prázdne pre auto-generated name
+s3_force_destroy = false # Nastav na true len pre dev/test
+
+# Additional Tags
+additional_tags = {
+  CostCenter = "Engineering"
+  Team       = "ML"
+}
