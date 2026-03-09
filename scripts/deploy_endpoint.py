@@ -2,7 +2,7 @@
 """
 SageMaker Endpoint Deployment Script
 
-Tento skript deployuje model z MLflow Model Registry na SageMaker real-time endpoint.
+Tento skript deployuje model z MLflow Model Registry alebo S3 na SageMaker real-time endpoint.
 
 Použitie:
     # Deploy konkrétnu verziu z MLflow Registry
@@ -12,13 +12,18 @@ Použitie:
     python scripts/deploy_endpoint.py --model-name house-price-xgboost --stage Production
 
     # Deploy z S3 (ak nemáš MLflow)
-    python scripts/deploy_endpoint.py --model-s3-uri s3://bucket/model.tar.gz
+    python scripts/deploy_endpoint.py --model-s3-uri s3://bucket/model.tar.gz --ecr-image-uri 123.dkr.ecr.eu-west-1.amazonaws.com/house-price:latest
+
+    # Deploy s Terraform integration (automaticky načíta ECR image a role)
+    python scripts/deploy_endpoint.py --model-s3-uri s3://bucket/model.tar.gz --use-terraform
 """
 import argparse
 import os
 import sys
 import logging
+import subprocess
 from datetime import datetime
+from pathlib import Path
 
 import boto3
 import sagemaker
@@ -30,8 +35,68 @@ from mlflow.tracking import MlflowClient
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format="[%(levelname)s] %(asctime)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
 )
+
+
+def get_terraform_output(key: str, tf_dir: str) -> str:
+    """
+    Získa hodnotu z Terraform output.
+
+    Args:
+        key: Terraform output key
+        tf_dir: Path k Terraform directory
+
+    Returns:
+        str: Output value
+    """
+    try:
+        result = subprocess.run(
+            ["terraform", "output", "-raw", key],
+            cwd=tf_dir,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to get Terraform output '{key}': {e.stderr}")
+        raise
+
+
+def load_terraform_config(base_dir: str = None) -> dict:
+    """
+    Načíta konfiguráciu z Terraform outputs.
+
+    Args:
+        base_dir: Base directory projektu (default: detekuje automaticky)
+
+    Returns:
+        dict: Configuration values
+    """
+    if base_dir is None:
+        # Detekuj base_dir (scripts/ -> root)
+        base_dir = Path(__file__).parent.parent.absolute()
+
+    sagemaker_tf_dir = Path(base_dir) / "infra" / "terraform" / "sagemaker"
+
+    if not sagemaker_tf_dir.exists():
+        raise FileNotFoundError(f"Terraform directory not found: {sagemaker_tf_dir}")
+
+    logger.info(f"Loading Terraform config from: {sagemaker_tf_dir}")
+
+    config = {
+        "execution_role_arn": get_terraform_output("sagemaker_execution_role_arn", str(sagemaker_tf_dir)),
+        "ecr_repository_url": get_terraform_output("ecr_repository_url", str(sagemaker_tf_dir)),
+        "aws_region": get_terraform_output("aws_region", str(sagemaker_tf_dir)),
+    }
+
+    logger.info(f"  Execution Role: {config['execution_role_arn']}")
+    logger.info(f"  ECR Repository: {config['ecr_repository_url']}")
+    logger.info(f"  AWS Region: {config['aws_region']}")
+
+    return config
 
 
 def parse_args():
@@ -83,8 +148,8 @@ def parse_args():
     parser.add_argument(
         "--instance-type",
         type=str,
-        default="ml.m5.large",
-        help="SageMaker instance type (default: ml.m5.large)",
+        default="ml.t2.medium",
+        help="SageMaker instance type (default: ml.t2.medium)",
     )
     parser.add_argument(
         "--instance-count",
@@ -96,12 +161,39 @@ def parse_args():
         "--role",
         type=str,
         default=None,
-        help="SageMaker execution role ARN (default: načíta z SageMaker session)",
+        help="SageMaker execution role ARN (default: z Terraform alebo SageMaker session)",
     )
     parser.add_argument(
         "--update-existing",
         action="store_true",
         help="Ak endpoint už existuje, aktualizuj ho (inak vytvor nový)",
+    )
+
+    # --- Docker image ---
+    parser.add_argument(
+        "--ecr-image-uri",
+        type=str,
+        default=None,
+        help="ECR image URI pre custom inference (default: z Terraform alebo AWS managed XGBoost)",
+    )
+    parser.add_argument(
+        "--ecr-image-tag",
+        type=str,
+        default="latest",
+        help="ECR image tag (default: latest)",
+    )
+
+    # --- Terraform integration ---
+    parser.add_argument(
+        "--use-terraform",
+        action="store_true",
+        help="Načítaj konfiguráciu (role, ECR image) z Terraform outputs",
+    )
+    parser.add_argument(
+        "--terraform-dir",
+        type=str,
+        default=None,
+        help="Path k Terraform directory (default: auto-detect)",
     )
 
     return parser.parse_args()
@@ -158,6 +250,7 @@ def create_sagemaker_model(
     role: str,
     image_uri: str,
     model_name: str,
+    use_custom_container: bool = True,
 ) -> Model:
     """
     Vytvorí SageMaker Model objekt.
@@ -167,20 +260,30 @@ def create_sagemaker_model(
         role: SageMaker execution role ARN
         image_uri: Docker image URI pre inference
         model_name: Názov SageMaker modelu
+        use_custom_container: Či používame custom container (vs AWS managed)
 
     Returns:
         sagemaker.model.Model
     """
+    # Environment variables pre inference
+    env_vars = {
+        "MODEL_SERVER_TIMEOUT": "120",
+        "MODEL_SERVER_WORKERS": "1",
+    }
+
+    # Ak používame custom container, nastav SageMaker-specific env vars
+    if use_custom_container:
+        env_vars.update({
+            "SAGEMAKER_PROGRAM": "src/serve/inference.py",
+            "SAGEMAKER_SUBMIT_DIRECTORY": "/opt/ml/code",
+        })
+
     model = Model(
         model_data=model_data,
         image_uri=image_uri,
         role=role,
         name=model_name,
-        # Môžeš pridať environment variables pre inference
-        env={
-            "MODEL_SERVER_TIMEOUT": "120",
-            "MODEL_SERVER_WORKERS": "1",
-        },
+        env=env_vars,
     )
 
     return model
@@ -188,34 +291,61 @@ def create_sagemaker_model(
 
 def deploy_endpoint(args):
     """Hlavná funkcia - deployuje model na SageMaker endpoint."""
-    logger.info("=== Deploying SageMaker Endpoint ===\n")
+    logger.info("=" * 80)
+    logger.info("SageMaker Endpoint Deployment")
+    logger.info("=" * 80)
+
+    # Load Terraform config ak required
+    tf_config = None
+    if args.use_terraform:
+        logger.info("\nLoading Terraform configuration...")
+        tf_config = load_terraform_config(args.terraform_dir)
 
     # SageMaker session
     session = sagemaker.Session()
     region = session.boto_region_name
+    logger.info(f"\nAWS Region: {region}")
 
     # Role
     role = args.role
-    if not role:
+    if not role and tf_config:
+        role = tf_config["execution_role_arn"]
+        logger.info(f"Using role from Terraform: {role}")
+    elif not role:
         role = sagemaker.get_execution_role()
-    logger.info(f"Using role: {role}")
+        logger.info(f"Using default role: {role}")
+    else:
+        logger.info(f"Using provided role: {role}")
 
     # Model S3 URI
     if args.model_name:
         model_data = get_model_from_mlflow(args)
     else:
         model_data = args.model_s3_uri
-        logger.info(f"Using S3 model: {model_data}")
+        logger.info(f"Model S3 URI: {model_data}")
 
-    # Image URI (použi default XGBoost inference container)
-    from sagemaker.image_uris import retrieve
-    image_uri = retrieve(
-        framework="xgboost",
-        region=region,
-        version="1.7-1",
-        image_scope="inference",
-    )
-    logger.info(f"Using inference image: {image_uri}\n")
+    # Image URI
+    image_uri = args.ecr_image_uri
+    use_custom_container = True
+
+    if not image_uri and tf_config:
+        # Use Terraform ECR repository
+        ecr_repo = tf_config["ecr_repository_url"]
+        image_uri = f"{ecr_repo}:{args.ecr_image_tag}"
+        logger.info(f"Using custom ECR image from Terraform: {image_uri}")
+    elif not image_uri:
+        # Use AWS managed XGBoost container
+        from sagemaker.image_uris import retrieve
+        image_uri = retrieve(
+            framework="xgboost",
+            region=region,
+            version="1.7-1",
+            image_scope="inference",
+        )
+        use_custom_container = False
+        logger.info(f"Using AWS managed XGBoost image: {image_uri}")
+    else:
+        logger.info(f"Using provided ECR image: {image_uri}")
 
     # Endpoint name
     endpoint_name = args.endpoint_name
@@ -227,29 +357,48 @@ def deploy_endpoint(args):
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             endpoint_name = f"house-price-{timestamp}"
 
-    logger.info(f"Endpoint name: {endpoint_name}")
+    logger.info(f"\nEndpoint Configuration:")
+    logger.info(f"  Name: {endpoint_name}")
+    logger.info(f"  Instance Type: {args.instance_type}")
+    logger.info(f"  Instance Count: {args.instance_count}")
 
     # Model name (musí byť unique)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     model_name = f"house-price-model-{timestamp}"
 
     # Vytvor model
-    logger.info("Vytváram SageMaker Model...")
-    model = create_sagemaker_model(model_data, role, image_uri, model_name)
+    logger.info("\n" + "=" * 80)
+    logger.info("Creating SageMaker Model...")
+    logger.info("=" * 80)
+    model = create_sagemaker_model(
+        model_data=model_data,
+        role=role,
+        image_uri=image_uri,
+        model_name=model_name,
+        use_custom_container=use_custom_container
+    )
+    logger.info(f"✓ Model created: {model_name}")
 
     # Check či endpoint už existuje
+    logger.info("\nChecking if endpoint exists...")
     sm_client = boto3.client("sagemaker", region_name=region)
     try:
-        sm_client.describe_endpoint(EndpointName=endpoint_name)
+        endpoint_info = sm_client.describe_endpoint(EndpointName=endpoint_name)
         endpoint_exists = True
-        logger.info(f"Endpoint '{endpoint_name}' už existuje.")
+        endpoint_status = endpoint_info["EndpointStatus"]
+        logger.info(f"  Endpoint '{endpoint_name}' exists (status: {endpoint_status})")
     except sm_client.exceptions.ClientError:
         endpoint_exists = False
+        logger.info(f"  Endpoint '{endpoint_name}' does not exist")
 
     # Deploy
     try:
+        logger.info("\n" + "=" * 80)
         if endpoint_exists and args.update_existing:
-            logger.info(f"Aktualizujem existujúci endpoint '{endpoint_name}'...")
+            logger.info(f"Updating Existing Endpoint: {endpoint_name}")
+            logger.info("=" * 80)
+            logger.info("This will perform a rolling update with zero downtime...")
+            logger.info("Expected time: 5-10 minutes")
             predictor = model.deploy(
                 initial_instance_count=args.instance_count,
                 instance_type=args.instance_type,
@@ -258,12 +407,21 @@ def deploy_endpoint(args):
                 wait=True,
             )
         elif endpoint_exists and not args.update_existing:
-            logger.error(f"Endpoint '{endpoint_name}' už existuje.")
-            logger.error("Použi --update-existing pre aktualizáciu alebo zmeň --endpoint-name")
+            logger.error("=" * 80)
+            logger.error(f"ERROR: Endpoint '{endpoint_name}' already exists")
+            logger.error("=" * 80)
+            logger.error("Options:")
+            logger.error("  1. Use --update-existing to update the endpoint")
+            logger.error("  2. Use --endpoint-name to create a new endpoint")
+            logger.error("  3. Delete existing endpoint first:")
+            logger.error(f"     aws sagemaker delete-endpoint --endpoint-name {endpoint_name}")
             sys.exit(1)
         else:
-            logger.info(f"Vytváram nový endpoint '{endpoint_name}'...")
-            logger.info("Tento proces môže trvať 5-10 minút...\n")
+            logger.info(f"Creating New Endpoint: {endpoint_name}")
+            logger.info("=" * 80)
+            logger.info("Expected time: 5-10 minutes")
+            logger.info("Endpoint will go through: Creating → InService")
+            logger.info("")
             predictor = model.deploy(
                 initial_instance_count=args.instance_count,
                 instance_type=args.instance_type,
@@ -271,14 +429,26 @@ def deploy_endpoint(args):
                 wait=True,
             )
 
-        logger.info("\n✓ Endpoint úspešne deploynutý!")
-        logger.info(f"Endpoint name: {endpoint_name}")
+        logger.info("\n" + "=" * 80)
+        logger.info("✓ DEPLOYMENT SUCCESSFUL!")
+        logger.info("=" * 80)
+        logger.info(f"Endpoint Name: {endpoint_name}")
         logger.info(f"Region: {region}")
+        logger.info(f"Status: InService")
+        logger.info(f"Instance Type: {args.instance_type}")
+        logger.info(f"Instance Count: {args.instance_count}")
+        logger.info("=" * 80)
 
         return predictor
 
     except Exception as e:
-        logger.error(f"\n✗ Deployment zlyhal: {e}")
+        logger.error("\n" + "=" * 80)
+        logger.error("✗ DEPLOYMENT FAILED")
+        logger.error("=" * 80)
+        logger.error(f"Error: {str(e)}")
+        logger.error("\nCheck CloudWatch logs:")
+        logger.error(f"  aws logs tail /aws/sagemaker/Endpoints/{endpoint_name} --follow")
+        logger.error("=" * 80)
         sys.exit(1)
 
 
@@ -330,29 +500,48 @@ def main():
 
     # Validácia
     if args.model_name and not args.mlflow_tracking_uri:
-        logger.error("--mlflow-tracking-uri je required ak používaš --model-name")
-        logger.error("Nastav MLFLOW_TRACKING_URI environment variable alebo použi --mlflow-tracking-uri")
+        logger.error("--mlflow-tracking-uri is required when using --model-name")
+        logger.error("Set MLFLOW_TRACKING_URI environment variable or use --mlflow-tracking-uri")
         sys.exit(1)
+
+    if args.use_terraform:
+        # Validate terraform is installed
+        try:
+            subprocess.run(["terraform", "version"], capture_output=True, check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            logger.error("Terraform not found. Install terraform or remove --use-terraform flag")
+            sys.exit(1)
 
     # Deploy
     predictor = deploy_endpoint(args)
 
-    # Test endpoint
+    # Test endpoint (optional - skip if update)
+    if not args.update_existing:
+        session = sagemaker.Session()
+        test_endpoint(predictor.endpoint_name, session.boto_region_name)
+
+    # Final instructions
+    logger.info("\n" + "=" * 80)
+    logger.info("NEXT STEPS")
+    logger.info("=" * 80)
+    logger.info("\n1. Test endpoint via AWS CLI:")
+    logger.info("   aws sagemaker-runtime invoke-endpoint \\")
+    logger.info(f"     --endpoint-name {predictor.endpoint_name} \\")
+    logger.info("     --body file://test_input.json \\")
+    logger.info("     --content-type application/json \\")
+    logger.info("     output.json")
+
+    logger.info("\n2. Monitor endpoint:")
+    logger.info(f"   aws sagemaker describe-endpoint --endpoint-name {predictor.endpoint_name}")
+
+    logger.info("\n3. View CloudWatch metrics:")
     session = sagemaker.Session()
-    test_endpoint(predictor.endpoint_name, session.boto_region_name)
+    region = session.boto_region_name
+    logger.info(f"   https://console.aws.amazon.com/cloudwatch/home?region={region}#metricsV2:graph=~();query=~'*7bAWS*2fSageMaker*2cEndpointName*2cVariantName*7d*20{predictor.endpoint_name}")
 
-    logger.info("\n" + "=" * 60)
-    logger.info("Endpoint info:")
-    logger.info(f"  Name: {predictor.endpoint_name}")
-    logger.info(f"  Region: {session.boto_region_name}")
-    logger.info("=" * 60)
-
-    logger.info("\nPouži endpoint:")
-    logger.info("  aws sagemaker-runtime invoke-endpoint \\")
-    logger.info(f"    --endpoint-name {predictor.endpoint_name} \\")
-    logger.info("    --body '{\"LotArea\": 8450, ...}' \\")
-    logger.info("    --content-type application/json \\")
-    logger.info("    output.json")
+    logger.info("\n4. Delete endpoint (when done):")
+    logger.info(f"   aws sagemaker delete-endpoint --endpoint-name {predictor.endpoint_name}")
+    logger.info("=" * 80)
 
 
 if __name__ == "__main__":

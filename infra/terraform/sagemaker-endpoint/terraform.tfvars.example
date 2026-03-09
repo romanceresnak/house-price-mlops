@@ -1,0 +1,78 @@
+# ============================================================================
+# SageMaker Endpoint Terraform Variables Example
+# Kopíruj tento súbor do terraform.tfvars a uprav hodnoty
+# ============================================================================
+
+# AWS Configuration
+aws_region   = "eu-west-1"
+project_name = "house-price-mlops"
+environment  = "prod"
+
+# ============================================================================
+# Model Configuration
+# ============================================================================
+
+model_name = "house-price-xgboost"
+
+# S3 URL pre model artifacts (získaj z training job output)
+# Example: s3://house-price-mlops-prod-models-abc123/training-jobs/job-name/output/model.tar.gz
+model_data_url = ""
+
+# SageMaker execution role ARN (z sagemaker terraform output)
+# Example: arn:aws:iam::123456789:role/house-price-mlops-prod-sagemaker-execution
+sagemaker_execution_role_arn = ""
+
+# ECR image URI (z sagemaker terraform output)
+# Example: 123456789.dkr.ecr.eu-west-1.amazonaws.com/house-price-mlops:latest
+ecr_image_uri = ""
+
+# ============================================================================
+# Endpoint Configuration
+# ============================================================================
+
+# Endpoint name (ponechaj prázdne pre auto-generated)
+endpoint_name = ""  # Will be: house-price-mlops-prod-endpoint
+
+# Instance configuration
+instance_type          = "ml.t2.medium"  # ~$0.065/hour (2 vCPU, 4GB RAM)
+initial_instance_count = 1
+
+# Production variant
+variant_name            = "AllTraffic"
+initial_variant_weight  = 1.0
+
+# ============================================================================
+# Auto-scaling (optional - odporúčané pre production)
+# ============================================================================
+
+enable_autoscaling               = false  # Nastav na true pre production
+min_instance_count               = 1
+max_instance_count               = 3
+target_invocations_per_instance  = 1000  # Scale when > 1000 invocations/instance
+
+# ============================================================================
+# Monitoring & Alarms
+# ============================================================================
+
+enable_cloudwatch_alarms = true
+
+# Email pre alarm notifications (optional)
+alarm_email = ""  # Example: your-email@example.com
+
+# Alarm thresholds
+model_latency_threshold_ms        = 5000  # 5 seconds
+invocation_error_rate_threshold   = 5     # 5%
+
+# Data Capture (optional - pre model monitoring)
+enable_data_capture               = false  # Nastav na true ak chceš monitoring
+data_capture_sampling_percentage  = 100    # Capture 100% requestov
+
+# ============================================================================
+# Tags (optional)
+# ============================================================================
+
+tags = {
+  Owner       = "MLOps Team"
+  CostCenter  = "ML"
+  Compliance  = "None"
+}
