@@ -1,0 +1,393 @@
+name: CD - Train and Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy_to_production:
+        description: 'Deploy directly to production (skip staging)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  AWS_REGION: eu-west-1
+  S3_DATA_BUCKET: ${{ secrets.S3_DATA_BUCKET }}
+  MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+  SAGEMAKER_ROLE_ARN: ${{ secrets.SAGEMAKER_ROLE_ARN }}
+
+jobs:
+  # ============================================================================
+  # Job 1: Build and Push Docker Image to ECR
+  # ============================================================================
+  build-image:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    outputs:
+      image-uri: ${{ steps.build.outputs.image-uri }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: house-price-mlops
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image-uri=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+  # ============================================================================
+  # Job 2: Run SageMaker Training Job
+  # ============================================================================
+  train:
+    name: Train Model on SageMaker
+    runs-on: ubuntu-latest
+    needs: build-image
+    outputs:
+      job-name: ${{ steps.train.outputs.job-name }}
+      model-s3-uri: ${{ steps.train.outputs.model-s3-uri }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install boto3 sagemaker mlflow
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run SageMaker Training Job
+        id: train
+        env:
+          ECR_IMAGE: ${{ needs.build-image.outputs.image-uri }}
+        run: |
+          JOB_NAME="house-price-${GITHUB_SHA::8}-$(date +%Y%m%d-%H%M%S)"
+          echo "Starting training job: $JOB_NAME"
+
+          python scripts/run_training_job.py \
+            --s3-data s3://${S3_DATA_BUCKET}/data/train.csv \
+            --job-name $JOB_NAME \
+            --ecr-image $ECR_IMAGE \
+            --role $SAGEMAKER_ROLE_ARN \
+            --mlflow-tracking-uri $MLFLOW_TRACKING_URI \
+            --mlflow-experiment-name house-prices-production \
+            --instance-type ml.m5.xlarge \
+            --n-estimators 1000 \
+            --max-depth 8 \
+            --learning-rate 0.03
+
+          # Získaj model S3 URI z outputu
+          MODEL_S3_URI=$(aws sagemaker describe-training-job \
+            --training-job-name $JOB_NAME \
+            --query 'ModelArtifacts.S3ModelArtifacts' \
+            --output text)
+
+          echo "job-name=$JOB_NAME" >> $GITHUB_OUTPUT
+          echo "model-s3-uri=$MODEL_S3_URI" >> $GITHUB_OUTPUT
+
+      - name: Log training metrics
+        run: |
+          echo "Training job completed: ${{ steps.train.outputs.job-name }}"
+          echo "Model artifact: ${{ steps.train.outputs.model-s3-uri }}"
+
+  # ============================================================================
+  # Job 3: Register Model in MLflow Model Registry
+  # ============================================================================
+  register-model:
+    name: Register Model in MLflow
+    runs-on: ubuntu-latest
+    needs: train
+    outputs:
+      model-version: ${{ steps.register.outputs.version }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install mlflow boto3
+
+      - name: Register model to Staging
+        id: register
+        env:
+          MODEL_S3_URI: ${{ needs.train.outputs.model-s3-uri }}
+        run: |
+          python - <<EOF
+          import mlflow
+          from mlflow.tracking import MlflowClient
+
+          mlflow.set_tracking_uri("$MLFLOW_TRACKING_URI")
+          client = MlflowClient()
+
+          # Nájdi najnovší run z training jobu
+          experiment = mlflow.get_experiment_by_name("house-prices-production")
+          runs = mlflow.search_runs(
+              experiment_ids=[experiment.experiment_id],
+              order_by=["start_time DESC"],
+              max_results=1
+          )
+
+          if len(runs) == 0:
+              raise Exception("No runs found")
+
+          run_id = runs.iloc[0]["run_id"]
+          print(f"Latest run ID: {run_id}")
+
+          # Register model
+          model_uri = f"runs:/{run_id}/model"
+          mv = mlflow.register_model(model_uri, "house-price-xgboost")
+
+          # Transition to Staging
+          client.transition_model_version_stage(
+              name="house-price-xgboost",
+              version=mv.version,
+              stage="Staging"
+          )
+
+          print(f"Model version {mv.version} registered and moved to Staging")
+          print(f"::set-output name=version::{mv.version}")
+          EOF
+
+  # ============================================================================
+  # Job 4: Deploy to Staging Endpoint
+  # ============================================================================
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: register-model
+    environment:
+      name: staging
+      url: https://staging.house-prices.example.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to Staging endpoint
+        env:
+          MODEL_VERSION: ${{ needs.register-model.outputs.model-version }}
+        run: |
+          python scripts/deploy_endpoint.py \
+            --model-name house-price-xgboost \
+            --stage Staging \
+            --mlflow-tracking-uri $MLFLOW_TRACKING_URI \
+            --endpoint-name house-price-staging \
+            --instance-type ml.m5.large \
+            --instance-count 1 \
+            --role $SAGEMAKER_ROLE_ARN \
+            --update-existing
+
+      - name: Run smoke tests on Staging
+        run: |
+          python - <<EOF
+          import boto3
+          import json
+
+          runtime = boto3.client('sagemaker-runtime', region_name='$AWS_REGION')
+
+          # Test payload
+          payload = {
+              "LotArea": 8450,
+              "OverallQual": 7,
+              "OverallCond": 5,
+              "YearBuilt": 2003,
+              "YearRemodAdd": 2003,
+              "TotalBsmtSF": 856,
+              "1stFlrSF": 856,
+              "2ndFlrSF": 854,
+              "GrLivArea": 1710,
+              "FullBath": 2,
+              "HalfBath": 1,
+              "BedroomAbvGr": 3,
+              "TotRmsAbvGrd": 8,
+              "GarageCars": 2,
+              "GarageArea": 548,
+              "WoodDeckSF": 0,
+              "OpenPorchSF": 61,
+          }
+
+          response = runtime.invoke_endpoint(
+              EndpointName="house-price-staging",
+              ContentType="application/json",
+              Body=json.dumps(payload)
+          )
+
+          result = json.loads(response['Body'].read().decode())
+          print(f"Staging endpoint test: {result}")
+
+          # Validácia
+          assert "predictions" in result
+          assert len(result["predictions"]) > 0
+          print("✅ Staging smoke test passed")
+          EOF
+
+  # ============================================================================
+  # Job 5: Deploy to Production (requires manual approval)
+  # ============================================================================
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [register-model, deploy-staging]
+    if: github.event.inputs.deploy_to_production == 'true' || github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://house-prices.example.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Transition model to Production in MLflow
+        env:
+          MODEL_VERSION: ${{ needs.register-model.outputs.model-version }}
+        run: |
+          python - <<EOF
+          import mlflow
+          from mlflow.tracking import MlflowClient
+
+          mlflow.set_tracking_uri("$MLFLOW_TRACKING_URI")
+          client = MlflowClient()
+
+          # Move to Production stage
+          client.transition_model_version_stage(
+              name="house-price-xgboost",
+              version=$MODEL_VERSION,
+              stage="Production",
+              archive_existing_versions=True
+          )
+
+          print(f"Model version $MODEL_VERSION promoted to Production")
+          EOF
+
+      - name: Deploy to Production endpoint
+        run: |
+          python scripts/deploy_endpoint.py \
+            --model-name house-price-xgboost \
+            --stage Production \
+            --mlflow-tracking-uri $MLFLOW_TRACKING_URI \
+            --endpoint-name house-price-production \
+            --instance-type ml.m5.xlarge \
+            --instance-count 2 \
+            --role $SAGEMAKER_ROLE_ARN \
+            --update-existing
+
+      - name: Run smoke tests on Production
+        run: |
+          python - <<EOF
+          import boto3
+          import json
+
+          runtime = boto3.client('sagemaker-runtime', region_name='$AWS_REGION')
+
+          payload = {
+              "LotArea": 8450,
+              "OverallQual": 7,
+              "OverallCond": 5,
+              "YearBuilt": 2003,
+              "YearRemodAdd": 2003,
+              "TotalBsmtSF": 856,
+              "1stFlrSF": 856,
+              "2ndFlrSF": 854,
+              "GrLivArea": 1710,
+              "FullBath": 2,
+              "HalfBath": 1,
+              "BedroomAbvGr": 3,
+              "TotRmsAbvGrd": 8,
+              "GarageCars": 2,
+              "GarageArea": 548,
+              "WoodDeckSF": 0,
+              "OpenPorchSF": 61,
+          }
+
+          response = runtime.invoke_endpoint(
+              EndpointName="house-price-production",
+              ContentType="application/json",
+              Body=json.dumps(payload)
+          )
+
+          result = json.loads(response['Body'].read().decode())
+          print(f"Production endpoint test: {result}")
+
+          assert "predictions" in result
+          assert len(result["predictions"]) > 0
+          print("✅ Production smoke test passed")
+          EOF
+
+      - name: Notify deployment success
+        if: success()
+        run: |
+          echo "🚀 Successfully deployed to Production!"
+          echo "Model version: ${{ needs.register-model.outputs.model-version }}"
+          echo "Endpoint: house-price-production"
