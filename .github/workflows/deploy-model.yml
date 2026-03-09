@@ -1,0 +1,352 @@
+name: Deploy Model to Endpoint
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_source:
+        description: 'Model source'
+        required: true
+        type: choice
+        options:
+          - mlflow-staging
+          - mlflow-production
+          - mlflow-version
+          - s3-uri
+        default: 'mlflow-staging'
+      model_version:
+        description: 'MLflow model version (if source=mlflow-version)'
+        required: false
+        type: string
+      model_s3_uri:
+        description: 'S3 URI to model.tar.gz (if source=s3-uri)'
+        required: false
+        type: string
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+        default: 'staging'
+      instance_type:
+        description: 'Instance type'
+        required: false
+        type: choice
+        options:
+          - ml.t2.medium
+          - ml.m5.large
+          - ml.m5.xlarge
+          - ml.m5.2xlarge
+        default: 'ml.t2.medium'
+      instance_count:
+        description: 'Number of instances'
+        required: false
+        type: number
+        default: 1
+      update_existing:
+        description: 'Update existing endpoint (zero-downtime)'
+        required: false
+        type: boolean
+        default: true
+
+env:
+  AWS_REGION: eu-west-1
+  MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+  SAGEMAKER_ROLE_ARN: ${{ secrets.SAGEMAKER_ROLE_ARN }}
+
+jobs:
+  # ============================================================================
+  # Validate Inputs
+  # ============================================================================
+  validate:
+    name: Validate Inputs
+    runs-on: ubuntu-latest
+    outputs:
+      endpoint-name: ${{ steps.validate.outputs.endpoint-name }}
+      deployment-type: ${{ steps.validate.outputs.deployment-type }}
+
+    steps:
+      - name: Validate inputs
+        id: validate
+        run: |
+          # Determine endpoint name
+          if [ "${{ github.event.inputs.environment }}" == "production" ]; then
+            ENDPOINT_NAME="house-price-production"
+          else
+            ENDPOINT_NAME="house-price-staging"
+          fi
+          echo "endpoint-name=$ENDPOINT_NAME" >> $GITHUB_OUTPUT
+
+          # Validate model source
+          if [ "${{ github.event.inputs.model_source }}" == "mlflow-version" ] && [ -z "${{ github.event.inputs.model_version }}" ]; then
+            echo "Error: model_version is required when source=mlflow-version"
+            exit 1
+          fi
+
+          if [ "${{ github.event.inputs.model_source }}" == "s3-uri" ] && [ -z "${{ github.event.inputs.model_s3_uri }}" ]; then
+            echo "Error: model_s3_uri is required when source=s3-uri"
+            exit 1
+          fi
+
+          # Determine deployment type
+          if [ "${{ github.event.inputs.model_source }}" == "s3-uri" ]; then
+            echo "deployment-type=s3" >> $GITHUB_OUTPUT
+          else
+            echo "deployment-type=mlflow" >> $GITHUB_OUTPUT
+          fi
+
+          echo "✅ Inputs validated successfully"
+          echo "Target: $ENDPOINT_NAME"
+          echo "Model source: ${{ github.event.inputs.model_source }}"
+          echo "Instance: ${{ github.event.inputs.instance_type }} (x${{ github.event.inputs.instance_count }})"
+
+  # ============================================================================
+  # Get Latest ECR Image
+  # ============================================================================
+  get-image:
+    name: Get ECR Image
+    runs-on: ubuntu-latest
+    needs: validate
+    outputs:
+      image-uri: ${{ steps.get-image.outputs.image-uri }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Get image URI
+        id: get-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: house-price-mlops
+        run: |
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
+          echo "image-uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "Using image: $IMAGE_URI"
+
+  # ============================================================================
+  # Deploy from MLflow
+  # ============================================================================
+  deploy-mlflow:
+    name: Deploy from MLflow
+    runs-on: ubuntu-latest
+    needs: [validate, get-image]
+    if: needs.validate.outputs.deployment-type == 'mlflow'
+    environment:
+      name: ${{ github.event.inputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy endpoint
+        env:
+          ENDPOINT_NAME: ${{ needs.validate.outputs.endpoint-name }}
+          ECR_IMAGE: ${{ needs.get-image.outputs.image-uri }}
+        run: |
+          DEPLOY_CMD="python scripts/deploy_endpoint.py \
+            --model-name house-price-xgboost \
+            --mlflow-tracking-uri $MLFLOW_TRACKING_URI \
+            --endpoint-name $ENDPOINT_NAME \
+            --instance-type ${{ github.event.inputs.instance_type }} \
+            --instance-count ${{ github.event.inputs.instance_count }} \
+            --role $SAGEMAKER_ROLE_ARN \
+            --ecr-image-uri $ECR_IMAGE"
+
+          # Add source-specific args
+          if [ "${{ github.event.inputs.model_source }}" == "mlflow-staging" ]; then
+            DEPLOY_CMD="$DEPLOY_CMD --stage Staging"
+          elif [ "${{ github.event.inputs.model_source }}" == "mlflow-production" ]; then
+            DEPLOY_CMD="$DEPLOY_CMD --stage Production"
+          elif [ "${{ github.event.inputs.model_source }}" == "mlflow-version" ]; then
+            DEPLOY_CMD="$DEPLOY_CMD --version ${{ github.event.inputs.model_version }}"
+          fi
+
+          # Add update flag if needed
+          if [ "${{ github.event.inputs.update_existing }}" == "true" ]; then
+            DEPLOY_CMD="$DEPLOY_CMD --update-existing"
+          fi
+
+          echo "Running: $DEPLOY_CMD"
+          eval $DEPLOY_CMD
+
+      - name: Test endpoint
+        env:
+          ENDPOINT_NAME: ${{ needs.validate.outputs.endpoint-name }}
+        run: |
+          python - <<EOF
+          import boto3
+          import json
+          import numpy as np
+
+          runtime = boto3.client('sagemaker-runtime', region_name='${{ env.AWS_REGION }}')
+
+          # Test payload
+          test_payload = {
+              "data": [[1710, 2003, 8, 5, 1, 856, 854, 0, 0, 3, 1710, 1, 1, 2, 1, 7, 2003, 2003, 548]]
+          }
+
+          response = runtime.invoke_endpoint(
+              EndpointName="$ENDPOINT_NAME",
+              ContentType="application/json",
+              Body=json.dumps(test_payload)
+          )
+
+          result = json.loads(response['Body'].read().decode())
+          print(f"Test response: {result}")
+
+          # Validate response
+          assert "predictions" in result, "Response missing 'predictions' key"
+          assert len(result["predictions"]) > 0, "No predictions returned"
+
+          prediction = np.exp(result['predictions'][0])
+          print(f"Predicted price: ${prediction:,.2f}")
+          print("✅ Endpoint test passed")
+          EOF
+
+  # ============================================================================
+  # Deploy from S3
+  # ============================================================================
+  deploy-s3:
+    name: Deploy from S3
+    runs-on: ubuntu-latest
+    needs: [validate, get-image]
+    if: needs.validate.outputs.deployment-type == 's3'
+    environment:
+      name: ${{ github.event.inputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy endpoint from S3
+        env:
+          ENDPOINT_NAME: ${{ needs.validate.outputs.endpoint-name }}
+          MODEL_S3_URI: ${{ github.event.inputs.model_s3_uri }}
+          ECR_IMAGE: ${{ needs.get-image.outputs.image-uri }}
+        run: |
+          DEPLOY_CMD="python scripts/deploy_endpoint.py \
+            --model-s3-uri $MODEL_S3_URI \
+            --endpoint-name $ENDPOINT_NAME \
+            --instance-type ${{ github.event.inputs.instance_type }} \
+            --instance-count ${{ github.event.inputs.instance_count }} \
+            --role $SAGEMAKER_ROLE_ARN \
+            --ecr-image-uri $ECR_IMAGE"
+
+          if [ "${{ github.event.inputs.update_existing }}" == "true" ]; then
+            DEPLOY_CMD="$DEPLOY_CMD --update-existing"
+          fi
+
+          echo "Running: $DEPLOY_CMD"
+          eval $DEPLOY_CMD
+
+      - name: Test endpoint
+        env:
+          ENDPOINT_NAME: ${{ needs.validate.outputs.endpoint-name }}
+        run: |
+          python - <<EOF
+          import boto3
+          import json
+          import numpy as np
+
+          runtime = boto3.client('sagemaker-runtime', region_name='${{ env.AWS_REGION }}')
+
+          test_payload = {
+              "data": [[1710, 2003, 8, 5, 1, 856, 854, 0, 0, 3, 1710, 1, 1, 2, 1, 7, 2003, 2003, 548]]
+          }
+
+          response = runtime.invoke_endpoint(
+              EndpointName="$ENDPOINT_NAME",
+              ContentType="application/json",
+              Body=json.dumps(test_payload)
+          )
+
+          result = json.loads(response['Body'].read().decode())
+          print(f"Test response: {result}")
+
+          assert "predictions" in result
+          assert len(result["predictions"]) > 0
+
+          prediction = np.exp(result['predictions'][0])
+          print(f"Predicted price: ${prediction:,.2f}")
+          print("✅ Endpoint test passed")
+          EOF
+
+  # ============================================================================
+  # Summary
+  # ============================================================================
+  summary:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [validate, deploy-mlflow, deploy-s3]
+    if: always()
+
+    steps:
+      - name: Print summary
+        run: |
+          echo "============================================"
+          echo "Model Deployment Summary"
+          echo "============================================"
+          echo "Environment: ${{ github.event.inputs.environment }}"
+          echo "Endpoint: ${{ needs.validate.outputs.endpoint-name }}"
+          echo "Model Source: ${{ github.event.inputs.model_source }}"
+          echo "Instance: ${{ github.event.inputs.instance_type }} (x${{ github.event.inputs.instance_count }})"
+          echo ""
+
+          if [ "${{ needs.deploy-mlflow.result }}" == "success" ] || [ "${{ needs.deploy-s3.result }}" == "success" ]; then
+            echo "✅ Deployment successful!"
+            echo ""
+            echo "Test endpoint:"
+            echo "  aws sagemaker-runtime invoke-endpoint \\"
+            echo "    --endpoint-name ${{ needs.validate.outputs.endpoint-name }} \\"
+            echo "    --body file://test_input.json \\"
+            echo "    --content-type application/json \\"
+            echo "    output.json"
+          else
+            echo "❌ Deployment failed"
+            echo "Check logs for details"
+          fi
+          echo "============================================"

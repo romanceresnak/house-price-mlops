@@ -183,7 +183,10 @@ jobs:
           )
 
           print(f"Model version {mv.version} registered and moved to Staging")
-          print(f"::set-output name=version::{mv.version}")
+
+          # Write to GITHUB_OUTPUT
+          with open("$GITHUB_OUTPUT", "a") as f:
+              f.write(f"version={mv.version}\n")
           EOF
 
   # ============================================================================

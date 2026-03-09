@@ -64,36 +64,96 @@ house-price-mlops/
 - [x] CI/CD workflows (.github/workflows/)
 - [x] Requirements.txt
 
-### 🚧 KROK 2: MLflow Tracking Server na AWS
-- [ ] Terraform: ECS Fargate cluster
-- [ ] RDS PostgreSQL backend store
-- [ ] S3 artifact store
-- [ ] Application Load Balancer
-- [ ] VPC + Security groups
+### ✅ KROK 2: MLflow Tracking Server na AWS
+- [x] Terraform: ECS Fargate cluster
+- [x] RDS PostgreSQL backend store
+- [x] S3 artifact store
+- [x] Application Load Balancer
+- [x] VPC + Security groups
+- [x] Auto-scaling + CloudWatch monitoring
 
-### 🚧 KROK 3: Lokálny Experiment v SageMaker Studio
-- [ ] EDA notebook
-- [ ] Feature engineering experimenty
-- [ ] MLflow tracking z notebooku
-- [ ] Model prototyping
+### ✅ KROK 3: Lokálne Experimenty v Notebookoch
+- [x] EDA notebook (01_eda.ipynb)
+- [x] Feature engineering experiments (02_feature_engineering.ipynb)
+- [x] MLflow tracking z notebooku (03_model_training.ipynb)
+- [x] Model prototyping a comparison
+- [x] Kaggle data download script
 
-### 🚧 KROK 4: SageMaker Training Job
-- [ ] Custom Docker image (Dockerfile)
-- [ ] ECR push pipeline
-- [ ] SageMaker Training Job script
-- [ ] MLflow remote tracking z jobu
+### ✅ KROK 4: SageMaker Training Job
+- [x] Custom Docker image (multi-stage Dockerfile)
+- [x] ECR repository a lifecycle policies
+- [x] Build and push script (build_and_push.sh)
+- [x] SageMaker Training Job script (run_training_job.py)
+- [x] MLflow remote tracking z jobu
+- [x] Terraform infrastructure (IAM, S3, ECR)
+- [x] Example training notebook (04_sagemaker_training.ipynb)
 
-### 🚧 KROK 5: SageMaker Endpoint Deployment
-- [ ] MLflow Model Registry integration
-- [ ] SageMaker endpoint deployment
-- [ ] Staging/Production environments
-- [ ] Smoke testy
+### ✅ KROK 5: SageMaker Endpoint Deployment
+- [x] MLflow Model Registry integration
+- [x] SageMaker endpoint deployment (deploy_endpoint.py)
+- [x] Staging/Production environments
+- [x] Auto-scaling a CloudWatch alarms
+- [x] Data capture pre model monitoring
+- [x] Terraform infrastructure (endpoints, monitoring)
+- [x] Example deployment notebook (05_endpoint_deployment.ipynb)
 
-### 🚧 KROK 6: CI/CD GitHub Actions
-- [ ] PR checks (lint, test)
-- [ ] Auto-train na push do main
-- [ ] Auto-deploy do staging
-- [ ] Manual approval pre production
+### ✅ KROK 6: CI/CD GitHub Actions
+- [x] PR checks (lint, test, security, dependencies)
+- [x] Auto-train na push do main
+- [x] Auto-deploy do staging
+- [x] Manual approval pre production
+- [x] Scheduled retraining (weekly)
+- [x] Manual model deployment workflow
+- [x] Complete CI/CD documentation
+
+## CI/CD Workflows
+
+### 🔍 CI - Continuous Integration
+
+**Trigger:** Pull requests a push do `main`/`develop`
+
+**Jobs:**
+- Code quality (Black, Flake8, isort)
+- Unit tests (Python 3.10, 3.11) s coverage
+- Security scan (Bandit)
+- Dependency vulnerabilities (pip-audit)
+
+### 🚀 CD - Continuous Deployment
+
+**Trigger:** Push do `main`
+
+**Flow:**
+```
+Build Docker → Train Model → Register to MLflow → Deploy Staging → [Approval] → Deploy Production
+```
+
+**Environments:**
+- **Staging**: Automatic deployment
+- **Production**: Requires manual approval
+
+### 🔄 Scheduled Retraining
+
+**Trigger:** Weekly (Monday 2 AM UTC)
+
+**Flow:**
+1. Check data freshness
+2. Run training job
+3. Evaluate metrics (RMSE < 0.15, R² > 0.80)
+4. If pass → Register to Staging
+5. If fail → Manual review needed
+
+### 🎯 Manual Model Deployment
+
+**Trigger:** Manual dispatch
+
+**Use Cases:**
+- Deploy specific model version
+- Rollback to previous version
+- Test before production
+
+**See:** [.github/workflows/README.md](.github/workflows/README.md) for detailed documentation
+
+---
 
 ## Quick Start
 
@@ -106,8 +166,11 @@ aws --version
 # Python 3.11+
 python --version
 
-# Terraform (pre Krok 2)
+# Terraform
 terraform --version
+
+# Docker
+docker --version
 ```
 
 ### 1. Inštalácia
